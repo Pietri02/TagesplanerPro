@@ -3,34 +3,26 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
 const bodyParser = require('body-parser');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const SECRET_KEY = 'dein-super-geheimer-schluessel-aendere-mich';
+const SECRET_KEY = process.env.SECRET_KEY || 'dein-super-geheimer-schluessel-aendere-mich';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/taskmaster';
+
+// Models
+const User = require('./models/User');
+const Task = require('./models/Task');
 
 // Middleware
 app.use(cors());
 app.use(bodyParser.json());
 app.use(express.static('public'));
 
-// Datenbankdateien
-const USERS_FILE = path.join(__dirname, 'users.json');
-const TASKS_FILE = path.join(__dirname, 'tasks.json');
-
-// Hilfsfunktionen für Datei-IO
-function readJSON(file) {
-  if (!fs.existsSync(file)) {
-    fs.writeFileSync(file, JSON.stringify([]));
-    return [];
-  }
-  return JSON.parse(fs.readFileSync(file, 'utf8'));
-}
-
-function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
+// MongoDB Verbindung
+mongoose.connect(MONGODB_URI)
+  .then(() => console.log('✅ MongoDB verbunden!'))
+  .catch(err => console.error('❌ MongoDB Fehler:', err));
 
 // Middleware zur Token-Verifizierung
 function authenticateToken(req, res, next) {
@@ -56,220 +48,250 @@ app.post('/api/register', async (req, res) => {
     return res.status(400).json({ error: 'Alle Felder sind erforderlich' });
   }
   
-  const users = readJSON(USERS_FILE);
-  
-  if (users.find(u => u.username === username)) {
-    return res.status(400).json({ error: 'Benutzername existiert bereits' });
+  try {
+    const existingUser = await User.findOne({ $or: [{ username }, { email }] });
+    
+    if (existingUser) {
+      if (existingUser.username === username) {
+        return res.status(400).json({ error: 'Benutzername existiert bereits' });
+      }
+      if (existingUser.email === email) {
+        return res.status(400).json({ error: 'E-Mail existiert bereits' });
+      }
+    }
+    
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    const newUser = new User({
+      username,
+      email,
+      password: hashedPassword,
+      fullName: fullName || username
+    });
+    
+    await newUser.save();
+    
+    res.status(201).json({ message: 'Benutzer erfolgreich erstellt', userId: newUser._id });
+  } catch (error) {
+    console.error('Register error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
   }
-  
-  if (users.find(u => u.email === email)) {
-    return res.status(400).json({ error: 'E-Mail existiert bereits' });
-  }
-  
-  const hashedPassword = await bcrypt.hash(password, 10);
-  
-  const newUser = {
-    id: Date.now().toString(),
-    username,
-    email,
-    password: hashedPassword,
-    fullName: fullName || username,
-    createdAt: new Date().toISOString()
-  };
-  
-  users.push(newUser);
-  writeJSON(USERS_FILE, users);
-  
-  res.status(201).json({ message: 'Benutzer erfolgreich erstellt', userId: newUser.id });
 });
 
 // Login
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   
-  const users = readJSON(USERS_FILE);
-  const user = users.find(u => u.username === username);
-  
-  if (!user) {
-    return res.status(400).json({ error: 'Benutzer nicht gefunden' });
-  }
-  
-  const validPassword = await bcrypt.compare(password, user.password);
-  
-  if (!validPassword) {
-    return res.status(400).json({ error: 'Falsches Passwort' });
-  }
-  
-  const token = jwt.sign(
-    { id: user.id, username: user.username },
-    SECRET_KEY,
-    { expiresIn: '7d' }
-  );
-  
-  res.json({
-    token,
-    user: {
-      id: user.id,
-      username: user.username,
-      email: user.email,
-      fullName: user.fullName
+  try {
+    const user = await User.findOne({ username });
+    
+    if (!user) {
+      return res.status(400).json({ error: 'Benutzer nicht gefunden' });
     }
-  });
+    
+    const validPassword = await bcrypt.compare(password, user.password);
+    
+    if (!validPassword) {
+      return res.status(400).json({ error: 'Falsches Passwort' });
+    }
+    
+    const token = jwt.sign(
+      { id: user._id.toString(), username: user.username },
+      SECRET_KEY,
+      { expiresIn: '7d' }
+    );
+    
+    res.json({
+      token,
+      user: {
+        id: user._id.toString(),
+        username: user.username,
+        email: user.email,
+        fullName: user.fullName
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
+  }
 });
 
 // Benutzerprofil abrufen
-app.get('/api/profile', authenticateToken, (req, res) => {
-  const users = readJSON(USERS_FILE);
-  const user = users.find(u => u.id === req.user.id);
-  
-  if (!user) {
-    return res.status(404).json({ error: 'Benutzer nicht gefunden' });
+app.get('/api/profile', authenticateToken, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id).select('-password');
+    
+    if (!user) {
+      return res.status(404).json({ error: 'Benutzer nicht gefunden' });
+    }
+    
+    res.json({
+      id: user._id.toString(),
+      username: user.username,
+      email: user.email,
+      fullName: user.fullName
+    });
+  } catch (error) {
+    console.error('Profile error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
   }
-  
-  res.json({
-    id: user.id,
-    username: user.username,
-    email: user.email,
-    fullName: user.fullName
-  });
 });
 
-// Alle Benutzer abrufen (für Teilen-Funktion)
-app.get('/api/users', authenticateToken, (req, res) => {
-  const users = readJSON(USERS_FILE);
-  const userList = users.map(u => ({
-    id: u.id,
-    username: u.username,
-    fullName: u.fullName
-  }));
-  res.json(userList);
+// Alle Benutzer abrufen
+app.get('/api/users', authenticateToken, async (req, res) => {
+  try {
+    const users = await User.find().select('username fullName');
+    const userList = users.map(u => ({
+      id: u._id.toString(),
+      username: u.username,
+      fullName: u.fullName
+    }));
+    res.json(userList);
+  } catch (error) {
+    console.error('Users error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
+  }
 });
 
 // Tasks abrufen
-app.get('/api/tasks', authenticateToken, (req, res) => {
-  const tasks = readJSON(TASKS_FILE);
-  const userTasks = tasks.filter(t => 
-    t.owner === req.user.id || 
-    (t.sharedWith && t.sharedWith.includes(req.user.id))
-  );
-  res.json(userTasks);
+app.get('/api/tasks', authenticateToken, async (req, res) => {
+  try {
+    const tasks = await Task.find({
+      $or: [
+        { owner: req.user.id },
+        { sharedWith: req.user.id }
+      ]
+    });
+    
+    const tasksWithStringId = tasks.map(task => ({
+      ...task.toObject(),
+      id: task._id.toString()
+    }));
+    
+    res.json(tasksWithStringId);
+  } catch (error) {
+    console.error('Tasks error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
+  }
 });
 
 // Task erstellen
-app.post('/api/tasks', authenticateToken, (req, res) => {
-  const tasks = readJSON(TASKS_FILE);
-  
-  const newTask = {
-    id: Date.now().toString(),
-    ...req.body,
-    owner: req.user.id,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString(),
-    history: [{
-      action: 'created',
-      timestamp: new Date().toISOString(),
-      user: req.user.username
-    }]
-  };
-  
-  tasks.push(newTask);
-  writeJSON(TASKS_FILE, tasks);
-  
-  res.status(201).json(newTask);
+app.post('/api/tasks', authenticateToken, async (req, res) => {
+  try {
+    const newTask = new Task({
+      ...req.body,
+      owner: req.user.id,
+      history: [{
+        action: 'created',
+        timestamp: new Date(),
+        user: req.user.username
+      }]
+    });
+    
+    await newTask.save();
+    
+    res.status(201).json({
+      ...newTask.toObject(),
+      id: newTask._id.toString()
+    });
+  } catch (error) {
+    console.error('Create task error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
+  }
 });
 
 // Task aktualisieren
-app.put('/api/tasks/:id', authenticateToken, (req, res) => {
-  const tasks = readJSON(TASKS_FILE);
-  const taskIndex = tasks.findIndex(t => t.id === req.params.id);
-  
-  if (taskIndex === -1) {
-    return res.status(404).json({ error: 'Task nicht gefunden' });
+app.put('/api/tasks/:id', authenticateToken, async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    
+    if (!task) {
+      return res.status(404).json({ error: 'Task nicht gefunden' });
+    }
+    
+    if (task.owner !== req.user.id && !task.sharedWith.includes(req.user.id)) {
+      return res.status(403).json({ error: 'Keine Berechtigung' });
+    }
+    
+    const historyEntry = {
+      action: 'updated',
+      timestamp: new Date(),
+      user: req.user.username,
+      changes: req.body
+    };
+    
+    Object.assign(task, req.body);
+    task.updatedAt = new Date();
+    task.history.push(historyEntry);
+    
+    await task.save();
+    
+    res.json({
+      ...task.toObject(),
+      id: task._id.toString()
+    });
+  } catch (error) {
+    console.error('Update task error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
   }
-  
-  const task = tasks[taskIndex];
-  
-  if (task.owner !== req.user.id && 
-      (!task.sharedWith || !task.sharedWith.includes(req.user.id))) {
-    return res.status(403).json({ error: 'Keine Berechtigung' });
-  }
-  
-  const updatedTask = {
-    ...task,
-    ...req.body,
-    id: task.id,
-    owner: task.owner,
-    updatedAt: new Date().toISOString(),
-    history: [
-      ...task.history,
-      {
-        action: 'updated',
-        timestamp: new Date().toISOString(),
-        user: req.user.username,
-        changes: req.body
-      }
-    ]
-  };
-  
-  tasks[taskIndex] = updatedTask;
-  writeJSON(TASKS_FILE, tasks);
-  
-  res.json(updatedTask);
 });
 
 // Task löschen
-app.delete('/api/tasks/:id', authenticateToken, (req, res) => {
-  const tasks = readJSON(TASKS_FILE);
-  const taskIndex = tasks.findIndex(t => t.id === req.params.id);
-  
-  if (taskIndex === -1) {
-    return res.status(404).json({ error: 'Task nicht gefunden' });
+app.delete('/api/tasks/:id', authenticateToken, async (req, res) => {
+  try {
+    const task = await Task.findById(req.params.id);
+    
+    if (!task) {
+      return res.status(404).json({ error: 'Task nicht gefunden' });
+    }
+    
+    if (task.owner !== req.user.id) {
+      return res.status(403).json({ error: 'Keine Berechtigung' });
+    }
+    
+    await Task.findByIdAndDelete(req.params.id);
+    
+    res.json({ message: 'Task gelöscht' });
+  } catch (error) {
+    console.error('Delete task error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
   }
-  
-  const task = tasks[taskIndex];
-  
-  if (task.owner !== req.user.id) {
-    return res.status(403).json({ error: 'Keine Berechtigung' });
-  }
-  
-  tasks.splice(taskIndex, 1);
-  writeJSON(TASKS_FILE, tasks);
-  
-  res.json({ message: 'Task gelöscht' });
 });
 
-// Statistiken abrufen
-app.get('/api/stats', authenticateToken, (req, res) => {
-  const tasks = readJSON(TASKS_FILE);
-  const userTasks = tasks.filter(t => t.owner === req.user.id);
-  
-  const stats = {
-    total: userTasks.length,
-    completed: userTasks.filter(t => t.status === 'completed').length,
-    pending: userTasks.filter(t => t.status === 'open').length,
-    waiting: userTasks.filter(t => t.status === 'waiting').length,
-    byCategory: {},
-    byPriority: {
-      low: userTasks.filter(t => t.priority === 'low').length,
-      normal: userTasks.filter(t => t.priority === 'normal').length,
-      high: userTasks.filter(t => t.priority === 'high').length
-    },
-    completionRate: userTasks.length > 0 
-      ? Math.round((userTasks.filter(t => t.status === 'completed').length / userTasks.length) * 100)
-      : 0
-  };
-  
-  // Kategorien zählen
-  userTasks.forEach(task => {
-    if (task.category) {
-      stats.byCategory[task.category] = (stats.byCategory[task.category] || 0) + 1;
-    }
-  });
-  
-  res.json(stats);
+// Statistiken
+app.get('/api/stats', authenticateToken, async (req, res) => {
+  try {
+    const tasks = await Task.find({ owner: req.user.id });
+    
+    const stats = {
+      total: tasks.length,
+      completed: tasks.filter(t => t.status === 'completed').length,
+      pending: tasks.filter(t => t.status === 'open').length,
+      waiting: tasks.filter(t => t.status === 'waiting').length,
+      byCategory: {},
+      byPriority: {
+        low: tasks.filter(t => t.priority === 'low').length,
+        normal: tasks.filter(t => t.priority === 'normal').length,
+        high: tasks.filter(t => t.priority === 'high').length
+      },
+      completionRate: tasks.length > 0 
+        ? Math.round((tasks.filter(t => t.status === 'completed').length / tasks.length) * 100)
+        : 0
+    };
+    
+    tasks.forEach(task => {
+      if (task.category) {
+        stats.byCategory[task.category] = (stats.byCategory[task.category] || 0) + 1;
+      }
+    });
+    
+    res.json(stats);
+  } catch (error) {
+    console.error('Stats error:', error);
+    res.status(500).json({ error: 'Serverfehler' });
+  }
 });
 
 app.listen(PORT, () => {
-  console.log(`✅ Server läuft auf http://localhost:${PORT}`);
-  console.log(`📂 Öffne deinen Browser und gehe zu: http://localhost:${PORT}`);
+  console.log(`✅ Server läuft auf Port ${PORT}`);
 });
